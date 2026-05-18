@@ -1,0 +1,106 @@
+{
+  "name": "My workflow 3 (Fixed)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "name": "Every 1 Minute",
+      "id": "b72f8322-13e9-406e-ada9-d1880e0492b1"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "limit": 100,
+        "simple": false,
+        "filters": {
+          "labelIds": [
+            "INBOX"
+          ],
+          "receivedAfter": "={{ $now.minus(3, 'minutes').toISO() }}"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        304,
+        0
+      ],
+      "name": "Get Emails",
+      "id": "755e05c2-207f-4893-9d11-f1164cb36996",
+      "webhookId": "bb3bfaa3-88d4-4c04-8870-7cd6d45ecde2",
+      "alwaysOutputData": true,
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "uhJ5xGpKYLQ6auMa",
+          "name": "Gmail account 6"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "async function run() {\n  const items = $input.all();\n  const fs = require('fs');\n\n  const basePath = '/data';\n  const trackingFile = `${basePath}/processed_ids.json`;\n\n  if (!fs.existsSync(basePath)) {\n    fs.mkdirSync(basePath, { recursive: true });\n  }\n\n  let processed = new Set();\n  if (fs.existsSync(trackingFile)) {\n    try {\n      processed = new Set(JSON.parse(fs.readFileSync(trackingFile, 'utf8')));\n    } catch {\n      processed = new Set();\n    }\n  }\n\n  const results = [];\n  let skippedCount = 0;\n\n  // FIX: Use explicit inputIndex to correctly map binary data\n  // even when items are skipped mid-loop\n  for (let i = 0; i < items.length; i++) {\n\n    const item = items[i];\n    const input = item.json;\n    const binary = item.binary || {};\n    const messageId = input.id;\n\n    // -------- SKIP ALREADY PROCESSED --------\n    if (!messageId || processed.has(messageId)) {\n      skippedCount++;\n      continue;\n    }\n\n    // -------- FIX: SKIP HOST'S OWN SENT EMAILS --------\n    // Gmail labels INBOX only for received mail.\n    // SENT label means the host sent this — skip it.\n    const labelIds = input.labelIds || [];\n    const isSent = labelIds.includes('SENT');\n    const isInbox = labelIds.includes('INBOX');\n\n    if (isSent || !isInbox) {\n      // This email was sent by the host (your reply) — do not process.\n      skippedCount++;\n      processed.add(messageId); // Mark so we don't re-evaluate\n      continue;\n    }\n\n    // -------- HEADERS SAFE --------\n    let headers = [];\n\n    if (Array.isArray(input.payload?.headers)) {\n      headers = input.payload.headers;\n    } else if (Array.isArray(input.headers)) {\n      headers = input.headers;\n    }\n\n    const getHeader = (name) => {\n      if (!Array.isArray(headers)) return '';\n      const found = headers.find(h => h.name === name);\n      return found ? found.value : '';\n    };\n\n    // -------- SUBJECT --------\n    const subjectRaw =\n      getHeader('Subject') ||\n      input.subject ||\n      'no-subject';\n\n    const subject = subjectRaw\n      .replace(/[^a-zA-Z0-9]/g, '_')\n      .slice(0, 60);\n\n    // -------- SENDER (FIXED) --------\n    let senderEmail = 'unknown-sender';\n\n    if (input.from?.value?.[0]?.address) {\n      senderEmail = input.from.value[0].address;\n    } else if (typeof input.from === 'string') {\n      const match = input.from.match(/<(.+?)>/);\n      senderEmail = match ? match[1] : input.from;\n    } else {\n      const fromHeader = getHeader('From');\n      const match = fromHeader.match(/<(.+?)>/);\n      senderEmail = match ? match[1] : fromHeader;\n    }\n\n    senderEmail = (senderEmail || 'unknown-sender')\n      .trim()\n      .toLowerCase();\n\n    const safeSender = senderEmail.replace(/[<>:\"/\\\\|?*]/g, '_');\n\n    // -------- FOLDER CREATION (UNCHANGED — intentional logic kept as-is) --------\n    let senderFolder = `${basePath}/${safeSender}`;\n    let counter = 2;\n\n    while (fs.existsSync(senderFolder)) {\n      senderFolder = `${basePath}/${safeSender} (${counter})`;\n      counter++;\n    }\n\n    fs.mkdirSync(senderFolder, { recursive: true });\n\n    // -------- TIMESTAMP --------\n    const timestamp = new Date()\n      .toISOString()\n      .replace(/[:.]/g, '-')\n      .slice(0, 19);\n\n    const folderPath = `${senderFolder}/${timestamp}_${subject}`;\n    fs.mkdirSync(folderPath, { recursive: true });\n\n    // -------- BODY EXTRACTION --------\n    const decode = (data) => {\n      try {\n        return Buffer.from(data, 'base64url').toString('utf8');\n      } catch {\n        return '';\n      }\n    };\n\n    const extractBody = (parts) => {\n      let html = null;\n      let text = null;\n\n      for (const part of parts || []) {\n\n        if (part.mimeType === 'text/html' && part.body?.data) {\n          html = decode(part.body.data);\n        }\n\n        if (part.mimeType === 'text/plain' && part.body?.data) {\n          text = decode(part.body.data);\n        }\n\n        if (part.parts) {\n          const res = extractBody(part.parts);\n          if (res.html) html = res.html;\n          if (res.text) text = res.text;\n        }\n      }\n\n      return { html, text };\n    };\n\n    const bodyParts = extractBody(input.payload?.parts);\n\n    const emailBody =\n      bodyParts.html ||\n      bodyParts.text ||\n      input.snippet ||\n      input.text ||\n      input.html ||\n      'no body';\n\n    // -------- WRITE EMAIL FILE --------\n    const content = [\n      `From: ${senderEmail}`,\n      `Subject: ${subjectRaw}`,\n      `Date: ${getHeader('Date') || ''}`,\n      '',\n      '----------------------------------------',\n      '',\n      emailBody\n    ].join('\\n');\n\n    fs.writeFileSync(`${folderPath}/email.txt`, content, 'utf8');\n\n    // -------- ATTACHMENTS (FIXED — full size, no truncation) --------\n    let attachmentCount = 0;\n\n    for (const [key, file] of Object.entries(binary)) {\n      if (!key.startsWith('attachment_')) continue;\n\n      try {\n        const fileName = (file.fileName || file.name || `${key}.bin`)\n          .replace(/[<>:\"/\\\\|?*]/g, '_');\n\n        const filePath = `${folderPath}/${fileName}`;\n\n        let buffer;\n\n        // FIX: Primary — use getBinaryDataBuffer with correct item index (i).\n        // This reads from n8n's separate binary store and returns the FULL\n        // untruncated file regardless of size.\n        try {\n          buffer = await this.helpers.getBinaryDataBuffer(i, key);\n        } catch (bufErr) {\n          // FIX: Fallback — if binary store read fails, decode from inline\n          // base64 data (used for small attachments that Gmail embeds directly).\n          if (file.data) {\n            buffer = Buffer.from(file.data, 'base64');\n          } else {\n            throw new Error(`No binary data available for ${key}: ${bufErr.message}`);\n          }\n        }\n\n        // FIX: Guard against empty/corrupt buffers — log and skip.\n        if (!buffer || buffer.length === 0) {\n          console.log(`[WARN] Empty buffer for attachment '${key}' in message ${messageId}. Skipping.`);\n          continue;\n        }\n\n        // FIX: Log size so you can verify against the original in email client.\n        console.log(`[OK] Saving '${fileName}' — size: ${buffer.length} bytes`);\n\n        fs.writeFileSync(filePath, buffer);\n        attachmentCount++;\n\n      } catch (err) {\n        console.log(`[ERROR] Attachment error (${key}):`, err.message);\n      }\n    }\n\n    processed.add(messageId);\n\n    results.push({\n      json: {\n        senderEmail,\n        subject: subjectRaw,\n        folderPath,\n        attachmentsSaved: attachmentCount\n      }\n    });\n  }\n\n  fs.writeFileSync(\n    trackingFile,\n    JSON.stringify([...processed].slice(-1000))\n  );\n\n  if (results.length === 0) {\n    return [{\n      json: {\n        status: \"no_new_emails\",\n        skipped: skippedCount\n      }\n    }];\n  }\n\n  return results;\n}\n\nreturn run();"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        0
+      ],
+      "name": "Process & Save Email",
+      "id": "4e39b63f-a78a-452d-aa93-e84eb5787199"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Every 1 Minute": {
+      "main": [
+        [
+          {
+            "node": "Get Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Emails": {
+      "main": [
+        [
+          {
+            "node": "Process & Save Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "ddf48a43-d9c6-4994-96a0-eeb1ef24a349",
+  "meta": {
+    "instanceId": "788084345ee6fd6b74358fd2a3eea4780b9ffa7d29be975c589f90225fcde2a9"
+  },
+  "id": "7YqhfI57PlzZBl3F",
+  "tags": []
+}
